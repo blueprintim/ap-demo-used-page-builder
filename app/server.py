@@ -58,6 +58,11 @@ def _make_sirv_publisher():
     return None
 
 
+@bp.route("/", methods=["GET"])
+def health():
+    return jsonify({"ok": True, "service": "crane-page-builder"})
+
+
 @bp.route("/build_product_page", methods=["POST"])
 def build_endpoint():
     if not _check_auth(request):
@@ -103,5 +108,9 @@ def create_app():
     return app
 
 
+# Module-level WSGI app for gunicorn:  gunicorn app.server:app
+app = create_app()
+
+
 if __name__ == "__main__":
-    create_app().run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
