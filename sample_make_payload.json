@@ -1,0 +1,14 @@
+{
+  "card_name": "Hiab 262 Jib Pkg VIN428061",
+  "trello_key": "<from Make Trello connection>",
+  "trello_token": "<from Make Trello connection>",
+  "product_group_dir": "hiab-boom-trucks",
+  "publish": true,
+  "attachments": [
+    { "url": "https://trello.com/1/cards/CARD_ID/attachments/ATT_ID/download/specs.xls", "name": "specs.xls" },
+    { "url": "https://trello.com/1/cards/CARD_ID/attachments/ATT_ID/download/1.mp4", "name": "1.mp4" },
+    { "url": "https://trello.com/1/cards/CARD_ID/attachments/ATT_ID/download/2.mp4", "name": "2.mp4" },
+    { "url": "https://trello.com/1/cards/CARD_ID/attachments/ATT_ID/download/1.jpg", "name": "1.jpg" },
+    { "url": "https://trello.com/1/cards/CARD_ID/attachments/ATT_ID/download/2.jpg", "name": "2.jpg" }
+  ]
+}

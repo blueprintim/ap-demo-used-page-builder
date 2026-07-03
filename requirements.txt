@@ -1,0 +1,6 @@
+Flask>=3.0
+pandas>=2.0
+xlrd>=2.0            # legacy .xls reading
+openpyxl>=3.1       # .xlsx reading
+requests>=2.31
+paramiko>=3.4       # SFTP publishing
