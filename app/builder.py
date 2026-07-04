@@ -133,7 +133,16 @@ def build_product_page(payload, *, publisher, sirv_publisher=None,
             raise BuildError(str(e), stage="download") from e
 
     if not sorted_files["spreadsheet"]:
-        raise BuildError("No spreadsheet (.xls/.xlsx) attachment found.", stage="download")
+        if local_files:
+            got = ", ".join(n for n, _ in local_files) or "(none)"
+        else:
+            got = ", ".join(
+                sorted_files.get("images", []) + sorted_files.get("videos", [])
+            ) or "(none)"
+        raise BuildError(
+            f"No spreadsheet (.xls/.xlsx) among received files. Got: {got}",
+            stage="download",
+        )
 
     # 2. Parse spec (hard fail) ----------------------------------------------
     try:
