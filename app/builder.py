@@ -41,6 +41,31 @@ def _image_ext(path):
     return ".jpg" if e in (".jpeg", ".jpg") else e
 
 
+def _normalize_attachments(raw):
+    """
+    Accept attachments in several shapes and return a flat list of
+    {url, name} dicts.
+
+    Handles:
+      - the expected clean list:        [ {url,name}, ... ]
+      - Make Basic Aggregator wrapper:  [ {"array":[ {url,name}, ... ], "__IMTAGGLENGTH__":N} ]
+      - a bare wrapper object:          {"array":[ {url,name}, ... ]}
+      - None / empty                    -> []
+    """
+    if not raw:
+        return []
+    # Bare wrapper object from an aggregator.
+    if isinstance(raw, dict) and "array" in raw and isinstance(raw["array"], list):
+        return [a for a in raw["array"] if isinstance(a, dict)]
+    if isinstance(raw, list):
+        # Single-element list wrapping an aggregator bundle.
+        if len(raw) == 1 and isinstance(raw[0], dict) and isinstance(raw[0].get("array"), list):
+            return [a for a in raw[0]["array"] if isinstance(a, dict)]
+        # Already a clean list of {url,name}.
+        return [a for a in raw if isinstance(a, dict) and "url" in a]
+    return []
+
+
 def build_product_page(payload, *, publisher, sirv_publisher=None,
                        sirv_public_base="https://blueprint.sirv.com",
                        product_group_dir_map=None, workdir=None, publish=True):
@@ -56,7 +81,7 @@ def build_product_page(payload, *, publisher, sirv_publisher=None,
                      None to skip video upload (video still concatenated).
     sirv_public_base: public URL base for Sirv (default https://blueprint.sirv.com).
     """
-    attachments = payload.get("attachments") or []
+    attachments = _normalize_attachments(payload.get("attachments"))
     if not attachments:
         raise BuildError("No attachments provided.", stage="input")
 
