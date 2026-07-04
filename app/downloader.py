@@ -132,12 +132,15 @@ def _leading_num(name: str) -> int:
 
 
 def _stream_download(sess, url, dest, key, token):
-    params = {}
-    # Trello attachment downloads may require auth; pass creds if given.
+    # Trello attachment *downloads* (unlike the REST API) require the credentials
+    # in an Authorization header, not as ?key=&token= query params -- query auth
+    # returns 401 for private attachment binaries. See Trello API docs on
+    # downloading attachments.
+    headers = {}
     if key and token:
-        params.update({"key": key, "token": token})
+        headers["Authorization"] = f'OAuth oauth_consumer_key="{key}", oauth_token="{token}"'
     try:
-        with sess.get(url, params=params or None, stream=True, timeout=60) as r:
+        with sess.get(url, headers=headers or None, stream=True, timeout=60) as r:
             r.raise_for_status()
             clen = r.headers.get("Content-Length")
             if clen and int(clen) > MAX_FILE_BYTES:
