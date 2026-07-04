@@ -22,6 +22,9 @@ from .publisher import SFTPPublisher, FTPPublisher, LocalMockPublisher, PublishE
 
 bp = Blueprint("build_product_page", __name__)
 
+# Where per-job uploaded pieces are stored between /upload_piece and /build.
+JOBS_ROOT = os.environ.get("JOBS_ROOT", "/tmp/cpb_jobs")
+
 # Map logo_key -> media sub-folder used in media_path. Adjust to your taxonomy.
 PRODUCT_GROUP_DIR_MAP = {
     "hiab": "hiab-boom-trucks",
@@ -29,6 +32,22 @@ PRODUCT_GROUP_DIR_MAP = {
     "palfinger": "palfinger",
     "multilift": "multilift-hooklifts",
 }
+
+
+def _safe_job_id(job_id):
+    """Sanitise a job id to a safe folder name."""
+    import re
+    jid = re.sub(r"[^A-Za-z0-9_-]", "", str(job_id or ""))
+    return jid[:64]
+
+
+def _job_dir(job_id):
+    jid = _safe_job_id(job_id)
+    if not jid:
+        return None
+    d = os.path.join(JOBS_ROOT, jid, "uploads")
+    os.makedirs(d, exist_ok=True)
+    return d
 
 
 def _check_auth(req):
@@ -63,6 +82,41 @@ def health():
     return jsonify({"ok": True, "service": "crane-page-builder"})
 
 
+@bp.route("/upload_piece", methods=["POST"])
+def upload_piece():
+    """
+    Phase 1 of the two-phase flow. Save ONE uploaded file into a job folder
+    keyed by job_id (the Trello card id). Called once per attachment by Make.
+    multipart form: job_id (text), file (file). Optional reset=true to clear
+    the job folder first (use on the first piece).
+    """
+    if not _check_auth(request):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    job_id = request.form.get("job_id")
+    d = _job_dir(job_id)
+    if not d:
+        return jsonify({"ok": False, "error": "missing or invalid job_id"}), 400
+
+    if _as_bool(request.form.get("reset", "false")):
+        # Clear any previous pieces for a fresh build.
+        import shutil
+        parent = os.path.dirname(d)
+        shutil.rmtree(parent, ignore_errors=True)
+        d = _job_dir(job_id)
+
+    f = (request.files.get("file")
+         or (request.files.getlist("files") or [None])[0])
+    if not f or not f.filename:
+        return jsonify({"ok": False, "error": "no file provided"}), 400
+
+    name = os.path.basename(f.filename)
+    f.save(os.path.join(d, name))
+    count = len([n for n in os.listdir(d) if os.path.isfile(os.path.join(d, n))])
+    return jsonify({"ok": True, "job_id": _safe_job_id(job_id),
+                    "saved": name, "pieces": count}), 200
+
+
 @bp.route("/build_product_page", methods=["POST"])
 def build_endpoint():
     if not _check_auth(request):
@@ -72,19 +126,54 @@ def build_endpoint():
     sirv_publisher = _make_sirv_publisher()
     sirv_base = os.environ.get("SIRV_PUBLIC_BASE", "https://blueprint.sirv.com")
 
-    # Three intake modes:
-    #  (a) multipart/form-data with uploaded files
-    #  (b) JSON body with a "files" array of {fileName, data(base64)} (Make aggregator)
+    # Phase-2 job build: job_id may arrive as a multipart/form field, a query
+    # arg, or in a JSON body. Check all three.
+    _jb = request.get_json(silent=True) or {}
+    job_id = (request.form.get("job_id")
+              or request.args.get("job_id")
+              or _jb.get("job_id"))
+
+    # Intake modes:
+    #  (0) job_id -> build from previously uploaded pieces
+    #  (a) multipart/form-data with uploaded files (or a single zip)
+    #  (b) JSON body with a "files" array of {fileName, data(base64)}
     #  (c) JSON body with attachment URLs (endpoint downloads them itself)
     uploaded = request.files.getlist("files") or list(request.files.values())
-    json_body = request.get_json(silent=True) if not uploaded else None
+    json_body = None if uploaded else _jb
 
     try:
-        if uploaded:
-            # Save uploads to a temp dir and hand the builder local file paths.
+        if job_id and not uploaded:
+            d = _job_dir(job_id)
+            src = request.form if request.form else (json_body or {})
+            local = [(n, os.path.join(d, n)) for n in sorted(os.listdir(d))
+                     if os.path.isfile(os.path.join(d, n))]
+            if not local:
+                return jsonify({"ok": False, "stage": "input",
+                                "error": f"no uploaded pieces for job {_safe_job_id(job_id)}"}), 422
+            payload = {
+                "publish": _as_bool(src.get("publish", True)),
+                "product_group_dir": src.get("product_group_dir"),
+                "card_name": src.get("card_name"),
+                "local_files": local,
+            }
+            publish = payload["publish"]
+            workdir = os.path.dirname(d)
+            result = build_product_page(
+                payload, publisher=publisher, sirv_publisher=sirv_publisher,
+                sirv_public_base=sirv_base, product_group_dir_map=PRODUCT_GROUP_DIR_MAP,
+                publish=publish, workdir=workdir,
+            )
+            # Clean up the job folder after a successful build.
+            import shutil
+            shutil.rmtree(workdir, ignore_errors=True)
+        elif uploaded:
             import tempfile
             workdir = tempfile.mkdtemp(prefix="cpb_up_")
-            saved = _save_uploads(uploaded, workdir)
+            # If a single zip was uploaded, extract it; else save files as-is.
+            if len(uploaded) == 1 and (uploaded[0].filename or "").lower().endswith(".zip"):
+                saved = _extract_zip(uploaded[0], workdir)
+            else:
+                saved = _save_uploads(uploaded, workdir)
             form = request.form
             payload = {
                 "publish": _as_bool(form.get("publish", "true")),
@@ -129,6 +218,18 @@ def build_endpoint():
                     workdir=workdir,
                 )
             else:
+                if not payload.get("attachments"):
+                    # Nothing usable arrived. Report what we saw to aid debugging.
+                    return jsonify({
+                        "ok": False, "stage": "input",
+                        "error": "No job_id, uploaded files, files array, or attachments found.",
+                        "debug": {
+                            "form_keys": list(request.form.keys()),
+                            "files_keys": list(request.files.keys()),
+                            "json_keys": list((_jb or {}).keys()),
+                            "content_type": request.content_type,
+                        },
+                    }), 422
                 result = build_product_page(
                     payload,
                     publisher=publisher,
@@ -152,6 +253,31 @@ def build_endpoint():
     result["dry_run"] = is_mock or not publish
     result.pop("page_html", None)
     return jsonify(result), 200
+
+
+def _extract_zip(file_storage, workdir):
+    """
+    Extract an uploaded zip into workdir/uploads; return [(name, path), ...].
+    Flat extraction (basename only), skips directories and junk.
+    """
+    import zipfile
+    up = os.path.join(workdir, "uploads")
+    os.makedirs(up, exist_ok=True)
+    tmp_zip = os.path.join(workdir, "incoming.zip")
+    file_storage.save(tmp_zip)
+    saved = []
+    with zipfile.ZipFile(tmp_zip) as zf:
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            name = os.path.basename(info.filename)
+            if not name or name.startswith("."):
+                continue
+            dest = os.path.join(up, name)
+            with zf.open(info) as src, open(dest, "wb") as out:
+                out.write(src.read())
+            saved.append((name, dest))
+    return saved
 
 
 def _decode_files(files_arr, workdir):
