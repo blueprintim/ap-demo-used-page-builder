@@ -72,10 +72,12 @@ def build_endpoint():
     sirv_publisher = _make_sirv_publisher()
     sirv_base = os.environ.get("SIRV_PUBLIC_BASE", "https://blueprint.sirv.com")
 
-    # Two intake modes:
-    #  (a) multipart/form-data with uploaded files (Make "Download an Attachment")
-    #  (b) JSON body with attachment URLs (endpoint downloads them itself)
+    # Three intake modes:
+    #  (a) multipart/form-data with uploaded files
+    #  (b) JSON body with a "files" array of {fileName, data(base64)} (Make aggregator)
+    #  (c) JSON body with attachment URLs (endpoint downloads them itself)
     uploaded = request.files.getlist("files") or list(request.files.values())
+    json_body = request.get_json(silent=True) if not uploaded else None
 
     try:
         if uploaded:
@@ -101,16 +103,40 @@ def build_endpoint():
                 workdir=workdir,
             )
         else:
-            payload = request.get_json(silent=True) or {}
+            payload = json_body or {}
             publish = payload.get("publish", True)
-            result = build_product_page(
-                payload,
-                publisher=publisher,
-                sirv_publisher=sirv_publisher,
-                sirv_public_base=sirv_base,
-                product_group_dir_map=PRODUCT_GROUP_DIR_MAP,
-                publish=publish,
-            )
+            # Mode (b): JSON "files" array of {fileName, data} where data is
+            # base64 (or a Make IMTBuffer hex string). Decode to local files.
+            files_arr = payload.get("files")
+            if files_arr:
+                import tempfile
+                workdir = tempfile.mkdtemp(prefix="cpb_js_")
+                saved = _decode_files(files_arr, workdir)
+                payload = {
+                    "publish": _as_bool(payload.get("publish", True)),
+                    "product_group_dir": payload.get("product_group_dir"),
+                    "card_name": payload.get("card_name"),
+                    "local_files": saved,
+                }
+                publish = payload["publish"]
+                result = build_product_page(
+                    payload,
+                    publisher=publisher,
+                    sirv_publisher=sirv_publisher,
+                    sirv_public_base=sirv_base,
+                    product_group_dir_map=PRODUCT_GROUP_DIR_MAP,
+                    publish=publish,
+                    workdir=workdir,
+                )
+            else:
+                result = build_product_page(
+                    payload,
+                    publisher=publisher,
+                    sirv_publisher=sirv_publisher,
+                    sirv_public_base=sirv_base,
+                    product_group_dir_map=PRODUCT_GROUP_DIR_MAP,
+                    publish=publish,
+                )
     except BuildError as e:
         return jsonify({"ok": False, "stage": e.stage, "error": str(e)}), 422
     except Exception as e:  # noqa: BLE001
@@ -126,6 +152,52 @@ def build_endpoint():
     result["dry_run"] = is_mock or not publish
     result.pop("page_html", None)
     return jsonify(result), 200
+
+
+def _decode_files(files_arr, workdir):
+    """
+    Decode a JSON files array [{fileName, data}, ...] to local files.
+    `data` may be base64 or a hex string (Make IMTBuffer often serializes to
+    hex). Returns [(name, path), ...].
+    """
+    import base64
+    import binascii
+    up = os.path.join(workdir, "uploads")
+    os.makedirs(up, exist_ok=True)
+    saved = []
+    for item in files_arr:
+        if not isinstance(item, dict):
+            continue
+        name = os.path.basename(item.get("fileName") or item.get("name") or "")
+        data = item.get("data")
+        if not name or data is None:
+            continue
+        raw = _decode_blob(data)
+        dest = os.path.join(up, name)
+        with open(dest, "wb") as f:
+            f.write(raw)
+        saved.append((name, dest))
+    return saved
+
+
+def _decode_blob(data):
+    """Decode a file blob that may be base64 or hex."""
+    import base64
+    import binascii
+    if isinstance(data, (bytes, bytearray)):
+        return bytes(data)
+    s = str(data).strip()
+    # Try hex first if it looks like hex (Make IMTBuffer hex dumps).
+    is_hexish = len(s) % 2 == 0 and all(c in "0123456789abcdefABCDEF" for c in s[:64])
+    if is_hexish:
+        try:
+            return binascii.unhexlify(s)
+        except (binascii.Error, ValueError):
+            pass
+    try:
+        return base64.b64decode(s, validate=False)
+    except (binascii.Error, ValueError):
+        return s.encode("utf-8", "ignore")
 
 
 def _save_uploads(files, workdir):
