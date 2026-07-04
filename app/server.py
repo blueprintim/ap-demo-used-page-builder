@@ -68,22 +68,49 @@ def build_endpoint():
     if not _check_auth(request):
         return jsonify({"ok": False, "error": "unauthorized"}), 401
 
-    payload = request.get_json(silent=True) or {}
-    publish = payload.get("publish", True)
-
     publisher, is_mock = _make_publisher()
     sirv_publisher = _make_sirv_publisher()
     sirv_base = os.environ.get("SIRV_PUBLIC_BASE", "https://blueprint.sirv.com")
 
+    # Two intake modes:
+    #  (a) multipart/form-data with uploaded files (Make "Download an Attachment")
+    #  (b) JSON body with attachment URLs (endpoint downloads them itself)
+    uploaded = request.files.getlist("files") or list(request.files.values())
+
     try:
-        result = build_product_page(
-            payload,
-            publisher=publisher,
-            sirv_publisher=sirv_publisher,
-            sirv_public_base=sirv_base,
-            product_group_dir_map=PRODUCT_GROUP_DIR_MAP,
-            publish=publish,
-        )
+        if uploaded:
+            # Save uploads to a temp dir and hand the builder local file paths.
+            import tempfile
+            workdir = tempfile.mkdtemp(prefix="cpb_up_")
+            saved = _save_uploads(uploaded, workdir)
+            form = request.form
+            payload = {
+                "publish": _as_bool(form.get("publish", "true")),
+                "product_group_dir": form.get("product_group_dir"),
+                "card_name": form.get("card_name"),
+                "local_files": saved,  # builder uses these instead of downloading
+            }
+            publish = payload["publish"]
+            result = build_product_page(
+                payload,
+                publisher=publisher,
+                sirv_publisher=sirv_publisher,
+                sirv_public_base=sirv_base,
+                product_group_dir_map=PRODUCT_GROUP_DIR_MAP,
+                publish=publish,
+                workdir=workdir,
+            )
+        else:
+            payload = request.get_json(silent=True) or {}
+            publish = payload.get("publish", True)
+            result = build_product_page(
+                payload,
+                publisher=publisher,
+                sirv_publisher=sirv_publisher,
+                sirv_public_base=sirv_base,
+                product_group_dir_map=PRODUCT_GROUP_DIR_MAP,
+                publish=publish,
+            )
     except BuildError as e:
         return jsonify({"ok": False, "stage": e.stage, "error": str(e)}), 422
     except Exception as e:  # noqa: BLE001
@@ -97,9 +124,28 @@ def build_endpoint():
                     pass
 
     result["dry_run"] = is_mock or not publish
-    # Don't ship the full page HTML back by default -- keep the response small.
     result.pop("page_html", None)
     return jsonify(result), 200
+
+
+def _save_uploads(files, workdir):
+    """Save Werkzeug FileStorage uploads into workdir/uploads; return [(name, path)]."""
+    import os as _os
+    up = _os.path.join(workdir, "uploads")
+    _os.makedirs(up, exist_ok=True)
+    saved = []
+    for f in files:
+        if not f or not f.filename:
+            continue
+        name = _os.path.basename(f.filename)
+        dest = _os.path.join(up, name)
+        f.save(dest)
+        saved.append((name, dest))
+    return saved
+
+
+def _as_bool(v):
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
 def create_app():

@@ -66,6 +66,35 @@ def _normalize_attachments(raw):
     return []
 
 
+def _sort_local_files(local_files):
+    """
+    Sort [(name, path), ...] into the same structure download_all returns:
+    {"spreadsheet": path|None, "images": [paths], "videos": [paths]}.
+    Extension-based, videos ordered by leading number in filename.
+    """
+    from .downloader import (
+        SPREADSHEET_EXTS, IMAGE_EXTS, VIDEO_EXTS, _leading_num,
+    )
+    spreadsheet = None
+    images, videos = [], []
+    for name, path in local_files:
+        ext = os.path.splitext(name)[1].lower()
+        if ext in SPREADSHEET_EXTS:
+            if spreadsheet is None:
+                spreadsheet = path
+        elif ext in IMAGE_EXTS:
+            images.append((name, path))
+        elif ext in VIDEO_EXTS:
+            videos.append((name, path))
+    images.sort(key=lambda t: (_leading_num(t[0]), t[0].lower()))
+    videos.sort(key=lambda t: (_leading_num(t[0]), t[0].lower()))
+    return {
+        "spreadsheet": spreadsheet,
+        "images": [p for _, p in images],
+        "videos": [p for _, p in videos],
+    }
+
+
 def build_product_page(payload, *, publisher, sirv_publisher=None,
                        sirv_public_base="https://blueprint.sirv.com",
                        product_group_dir_map=None, workdir=None, publish=True):
@@ -81,22 +110,27 @@ def build_product_page(payload, *, publisher, sirv_publisher=None,
                      None to skip video upload (video still concatenated).
     sirv_public_base: public URL base for Sirv (default https://blueprint.sirv.com).
     """
-    attachments = _normalize_attachments(payload.get("attachments"))
-    if not attachments:
-        raise BuildError("No attachments provided.", stage="input")
-
     tmp = workdir or tempfile.mkdtemp(prefix="cpb_")
     dl_dir = os.path.join(tmp, "downloads")
 
-    # 1. Download & sort ------------------------------------------------------
-    try:
-        sorted_files = download_all(
-            attachments, dl_dir,
-            trello_key=payload.get("trello_key"),
-            trello_token=payload.get("trello_token"),
-        )
-    except DownloadError as e:
-        raise BuildError(str(e), stage="download") from e
+    local_files = payload.get("local_files")
+    if local_files:
+        # Files were already downloaded (e.g. by Make) and handed to us as
+        # [(name, path), ...]. Sort them the same way the downloader would.
+        sorted_files = _sort_local_files(local_files)
+    else:
+        attachments = _normalize_attachments(payload.get("attachments"))
+        if not attachments:
+            raise BuildError("No attachments provided.", stage="input")
+        # 1. Download & sort --------------------------------------------------
+        try:
+            sorted_files = download_all(
+                attachments, dl_dir,
+                trello_key=payload.get("trello_key"),
+                trello_token=payload.get("trello_token"),
+            )
+        except DownloadError as e:
+            raise BuildError(str(e), stage="download") from e
 
     if not sorted_files["spreadsheet"]:
         raise BuildError("No spreadsheet (.xls/.xlsx) attachment found.", stage="download")
