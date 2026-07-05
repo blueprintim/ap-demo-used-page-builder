@@ -21,6 +21,13 @@ All remote paths are relative to a configured web root.
 from __future__ import annotations
 import os
 import posixpath
+import socket
+
+# Hard ceiling on how long a single connect/login may block. Kept well under
+# gunicorn's default 30s worker timeout so a bad host/port/credential surfaces
+# as a clean PublishError (-> JSON error) instead of hanging until the worker is
+# killed and the client gets a bare HTML 500. Override with PUBLISH_CONNECT_TIMEOUT.
+CONNECT_TIMEOUT = int(os.environ.get("PUBLISH_CONNECT_TIMEOUT", "15"))
 
 
 class PublishError(Exception):
@@ -78,12 +85,27 @@ class SFTPPublisher:
     def _connect(self):
         if self._sftp:
             return
-        t = self._paramiko.Transport((self.host, self.port))
-        if self.keyfile:
-            pkey = self._paramiko.RSAKey.from_private_key_file(self.keyfile)
-            t.connect(username=self.user, pkey=pkey)
-        else:
-            t.connect(username=self.user, password=self.password)
+        # Open the TCP socket ourselves with a timeout -- paramiko's
+        # Transport((host, port)) form blocks indefinitely on an unreachable
+        # host, which is exactly what caused the 30s worker-timeout 500s.
+        try:
+            sock = socket.create_connection((self.host, self.port), CONNECT_TIMEOUT)
+        except OSError as e:
+            raise PublishError(
+                f"SFTP connect to {self.host}:{self.port} failed: {e}"
+            ) from e
+        t = self._paramiko.Transport(sock)
+        t.banner_timeout = CONNECT_TIMEOUT
+        t.auth_timeout = CONNECT_TIMEOUT
+        try:
+            if self.keyfile:
+                pkey = self._paramiko.RSAKey.from_private_key_file(self.keyfile)
+                t.connect(username=self.user, pkey=pkey)
+            else:
+                t.connect(username=self.user, password=self.password)
+        except Exception as e:  # noqa: BLE001 -- paramiko.SSHException et al.
+            t.close()
+            raise PublishError(f"SFTP auth/handshake to {self.host} failed: {e}") from e
         self._client = t
         self._sftp = self._paramiko.SFTPClient.from_transport(t)
 
@@ -164,11 +186,25 @@ class FTPPublisher:
         if self._conn:
             return
         cls = self._ftplib.FTP_TLS if self.tls else self._ftplib.FTP
-        self._conn = cls()
-        self._conn.connect(self.host, self.port, timeout=60)
-        self._conn.login(self.user, self.password)
-        if self.tls:
-            self._conn.prot_p()
+        conn = cls()
+        # timeout applies to the control socket AND (via self.timeout) to passive
+        # data connections, so a firewalled PASV port can no longer hang forever.
+        try:
+            conn.connect(self.host, self.port, timeout=CONNECT_TIMEOUT)
+            conn.login(self.user, self.password)
+            if self.tls:
+                conn.prot_p()
+        except self._ftplib.all_errors as e:  # includes OSError, socket.timeout
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+            raise PublishError(
+                f"FTP connect/login to {self.host}:{self.port} "
+                f"(tls={self.tls}) failed: {e}"
+            ) from e
+        conn.set_pasv(True)
+        self._conn = conn
 
     def _remote(self, rel):
         rel = rel.lstrip("/")
