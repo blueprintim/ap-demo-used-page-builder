@@ -37,6 +37,24 @@ performs a dry run (renders + reports, no writes).
 | `SIRV_FTP_HOST` / `SIRV_FTP_USER` / `SIRV_FTP_PASSWORD` / `SIRV_PUBLIC_BASE` | Sirv video upload over FTP (ftp.sirv.com → `/atlas-polar/<slug>.mp4`). If unset, video is concatenated but not uploaded. |
 | `SFTP_*` or `WEB_FTP_*` | Web-server publish target for the page + images. If neither set, writes to `MOCK_PUBLISH_DIR` (dry run). |
 | `MOCK_PUBLISH_DIR` | Local dir for mock publishing (default `/tmp/cpb_publish`). |
+| `PUBLISH_CONNECT_TIMEOUT` | Seconds a publisher connect/login may block before failing with a clean error (default 15). Keep it under the gunicorn worker timeout. |
+| `GUNICORN_TIMEOUT` / `WEB_CONCURRENCY` | Worker request timeout (default 300s) and worker count (default 2) — read by `gunicorn.conf.py`. |
+
+## Deploy (Render) — start command
+
+Use the config file so a real (slow, large-video) build isn't killed by
+gunicorn's 30s default worker timeout:
+
+```
+gunicorn -c gunicorn.conf.py app.server:app
+```
+
+A build downloads/concatenates video and uploads ~100–200 MB to Sirv, which
+routinely exceeds 30s. With the default timeout the worker is killed mid-build
+and the caller gets a bare HTML 500 — and because the Make HTTP module has
+`stopOnHttpError: false`, the scenario reports SUCCESS while nothing published.
+Set the start command above (300s timeout) and set `stopOnHttpError: true` on
+the Make HTTP modules so real failures surface.
 
 ## Local run / test
 ```bash
